@@ -6,5 +6,13 @@
   "de": {
     "ui.center_arc_follows_cursor": "Mittelpunkt-Kreisbogen folgt der Richtung des Mauszeigers",
     "ui.center_arc_follows_cursor_tip": "Ein Mittelpunkt-Kreisbogen läuft im oder gegen den Uhrzeigersinn, je nachdem, wie der Mauszeiger um seinen Mittelpunkt geführt wird. Aus: immer gegen den Uhrzeigersinn vom Start aus."
+  },
+  "ja": {
+    "ui.center_arc_follows_cursor": "中心点円弧はカーソルの向きに従う",
+    "ui.center_arc_follows_cursor_tip": "中心点円弧は、カーソルが中心の周りを回る向きに合わせて時計回りまたは反時計回りに描かれます。オフ: 常に始点から反時計回りです。"
+  },
+  "zh": {
+    "ui.center_arc_follows_cursor": "中心点圆弧跟随光标方向",
+    "ui.center_arc_follows_cursor_tip": "中心点圆弧按光标绕中心移动的方向沿顺时针或逆时针绘制。关闭：始终从起点逆时针绘制。"
   }
 }
