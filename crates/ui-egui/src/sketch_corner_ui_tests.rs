@@ -29,14 +29,18 @@ fn three_point_arc_follows_its_snapped_through_point_after_dimension_change() {
 
 /// #6645: the centre-point arc runs the way the cursor went round the centre from the start.
 /// Round clockwise to the top it is three quarters through the bottom; counter-clockwise, as
-/// before, the quarter through the upper right. The start keeps its place and its name.
+/// before, the quarter through the upper right. The start keeps its place and its name. With
+/// the preference off it is counter-clockwise whichever way the cursor went, as it always was.
 #[test]
 fn center_point_arc_runs_the_way_the_cursor_went_round() {
-    for (path, reversed, through) in [
-        (&[[7, -7, 0], [0, -10, 0], [-10, 0, 0], [-7, 7, 0]][..], true, Vec2::new(0.0, -10.0)),
-        (&[[7, 7, 0]][..], false, Vec2::new(7.071_067_811_865_476, 7.071_067_811_865_476)),
-    ] {
+    let clockwise = &[[7, -7, 0], [0, -10, 0], [-10, 0, 0], [-7, 7, 0]][..];
+    let quarter = Vec2::new(7.071_067_811_865_476, 7.071_067_811_865_476);
+    for (follow, path, reversed, through) in
+        [(true, clockwise, true, Vec2::new(0.0, -10.0)), (true, &[[7, 7, 0]][..], false, quarter), (false, clockwise, false, quarter)]
+    {
         let mut h = crate::scenario::Harness::new();
+        assert!(h.app.preferences.center_arc_follows_cursor, "on by default");
+        h.app.preferences.center_arc_follows_cursor = follow;
         h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
         h.settle();
         h.step(&json!({"start":"sketch.arc.center_point"})).unwrap();

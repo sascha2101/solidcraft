@@ -1,0 +1,10 @@
+{
+  "en": {
+    "ui.center_arc_follows_cursor": "Center point arc follows the cursor's direction",
+    "ui.center_arc_follows_cursor_tip": "A center point arc runs clockwise or counter-clockwise the way the cursor goes round its center. Off: always counter-clockwise from the start."
+  },
+  "de": {
+    "ui.center_arc_follows_cursor": "Mittelpunkt-Kreisbogen folgt der Richtung des Mauszeigers",
+    "ui.center_arc_follows_cursor_tip": "Ein Mittelpunkt-Kreisbogen läuft im oder gegen den Uhrzeigersinn, je nachdem, wie der Mauszeiger um seinen Mittelpunkt geführt wird. Aus: immer gegen den Uhrzeigersinn vom Start aus."
+  }
+}

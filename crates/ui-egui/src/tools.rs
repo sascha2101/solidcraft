@@ -211,9 +211,14 @@ pub fn on_hover(app: &mut SolveApp, proj: &Proj, pos: Pos2, shift: bool) {
     } else {
         sketch_point_at(app, proj, pos)
     };
+    let follow = app.preferences.center_arc_follows_cursor;
     if let Some(t) = app.tool.as_mut() {
         t.hover = h;
-        follow_arc_turn(t);
+        if follow {
+            follow_arc_turn(t);
+        } else {
+            t.arc_turn = 0.0;
+        }
     }
 }
 
