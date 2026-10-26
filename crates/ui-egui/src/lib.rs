@@ -359,6 +359,8 @@ pub struct Services {
     pub graphics_path: Option<String>,
     /// Linux: the window system this run uses, `wayland` or `x11` (Preferences shows it, #3083).
     pub window_system: Option<&'static str>,
+    /// Adapter names and descriptive labels from the desktop renderer's chosen backends.
+    pub graphics_adapters: Vec<(String, String)>,
     /// HTTPS GET for the update check (`update`); None: never check (browser, tests).
     pub http_get: Option<update::HttpGet>,
     /// HTTPS download to a file, with progress, for one-click updates (`update::install`).
@@ -484,8 +486,10 @@ pub struct SolveApp {
     pub stand_up_occurrence: Option<u64>,
     /// The file's header names an exporter that saves Y up (SolidWorks): the offer says so.
     pub stand_up_reason: bool,
-    /// The anti-aliasing sample counts the graphics device supports (empty without a GPU).
+    /// The anti-aliasing sample counts the scene colour/depth formats support (empty without a GPU).
     pub msaa_supported: Vec<u32>,
+    /// The startup check selected 1x; Graphics explains the workaround.
+    pub msaa_compatibility: bool,
     /// Settings put back at start because they kept SolidCraft from starting, one line each,
     /// shown until dismissed (`prefs::show_reset_notice`).
     pub settings_reset: Vec<prefs::SettingReset>,
@@ -500,7 +504,7 @@ pub struct SolveApp {
     pub native_resize_border: bool,
     /// macOS: the traffic lights sit over the application bar's left end.
     pub integrated_titlebar: bool,
-    /// The desktop host installed a system File menu; omit the in-window duplicate.
+    /// The desktop host installed native menus alongside the application bar controls.
     pub native_file_menu: bool,
     /// Build bodies' display meshes on the CPU even where the GPU could (safe mode). Read by
     /// [`SolveApp::set_wgpu`].
@@ -634,6 +638,7 @@ impl SolveApp {
             stand_up_occurrence: None,
             stand_up_reason: false,
             msaa_supported: Vec::new(),
+            msaa_compatibility: false,
             settings_reset: Vec::new(),
             big_operation: false,
             autosave_minutes: 5.0,
@@ -700,8 +705,9 @@ impl SolveApp {
 
     /// Draw the viewport on the GPU with the scene drawn offscreen: `depth_bits`/`stencil_bits`
     /// and `samples` are the scene's, while the window's pass (egui's) has no depth and one
-    /// sample. The scene keeps its depth and anti-aliasing; the UI pass pays for neither.
-    pub fn set_wgpu_split(&mut self, rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, samples: u32) {
+    /// sample. Native hosts check the installed renderer and fall back to 1x only when that
+    /// succeeds where multisampling fails. Returns the effective scene sample count.
+    pub fn set_wgpu_split(&mut self, rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, samples: u32) -> u32 {
         let scene = crate::gpu::GpuTarget {
             format: rs.target_format,
             depth: egui_wgpu::depth_format_from_bits(depth_bits, stencil_bits),
@@ -710,11 +716,34 @@ impl SolveApp {
         };
         let window = crate::gpu::GpuTarget { format: rs.target_format, depth: None, samples: 1, tess: false };
         self.set_wgpu_targets(rs, scene, window);
+        self.viewport.gpu.map_or(samples, |g| g.samples)
     }
 
     fn set_wgpu_targets(&mut self, rs: &egui_wgpu::RenderState, scene: crate::gpu::GpuTarget, window: crate::gpu::GpuTarget) {
-        let (target, stats) = gpu::install(rs, scene, window, !self.cpu_meshing);
-        self.viewport.gpu = Some(target);
+        #[allow(unused_mut)] // Only native hosts can wait for the startup readback.
+        let (mut installed, stats) = gpu::install(rs, scene, window, !self.cpu_meshing);
+        #[cfg(not(target_arch = "wasm32"))]
+        if scene.depth.is_some() && window.depth.is_none() && window.samples == 1 {
+            let mut renderer = rs.renderer.write();
+            if let Some(res) = renderer.callback_resources.get_mut::<gpu::Renderer>() {
+                match res.check_msaa(&rs.device, &rs.queue) {
+                    Ok(solidcraft_gpu::view::MsaaCheck::Passed) => {}
+                    Ok(solidcraft_gpu::view::MsaaCheck::Fallback) => {
+                        installed.samples = 1;
+                        self.msaa_compatibility = true;
+                        eprintln!(
+                            "SolidCraft graphics: anti-aliasing check failed at {}x and passed at 1x; using 1x for this session",
+                            scene.samples
+                        );
+                    }
+                    Ok(solidcraft_gpu::view::MsaaCheck::FailedAtOne) => {
+                        eprintln!("SolidCraft graphics: anti-aliasing check also failed at 1x; keeping {}x", scene.samples);
+                    }
+                    Err(error) => eprintln!("SolidCraft graphics: anti-aliasing check error; keeping {}x: {error}", scene.samples),
+                }
+            }
+        }
+        self.viewport.gpu = Some(installed);
         self.viewport.draw_stats = Some(stats);
         render_workspace::invalidate_scene(self);
         let (samples, has_depth) = self.viewport.gpu.map_or((1, false), |g| (g.samples.max(1), g.depth.is_some()));
@@ -1045,6 +1074,10 @@ impl SolveApp {
             }
             return;
         }
+        if id == "inspect.colored_components" {
+            drop(self.run(id, serde_json::json!({})));
+            return;
+        }
         if id == "material.properties.validate" {
             self.material_card_review = Some(material_card_review::ReviewWindow::default());
             self.home.open = false;
@@ -1085,6 +1118,12 @@ impl SolveApp {
         self.home.open = false;
         if let Some(ext) = id.strip_prefix("sketch.insert_").filter(|e| matches!(*e, "dxf" | "svg")) {
             self.pick_open_command(id, json!({}), &[ext]);
+            return;
+        }
+        if id == "component.update_links" && !self.session.doc.links.is_empty() {
+            // Reading the linked designs again takes a while in a large assembly: off the window
+            // thread, the overlay naming the one being read (#5329).
+            let _ = file_load::begin_request(self, file_load::Request::new("", file_load::Kind::UpdateLinks));
             return;
         }
         if id == "component.insert_design" {
@@ -1208,7 +1247,7 @@ impl SolveApp {
                     | "sketch.constraint.tangent"
                     | "sketch.constraint.concentric"
                     | "sketch.constraint.collinear"
-            ) && let [solidcraft_engine::Sel::SketchCurve { id: a }, solidcraft_engine::Sel::SketchCurve { id: b }] =
+            ) && let [solidcraft_engine::Sel::SketchCurve { id: a, .. }, solidcraft_engine::Sel::SketchCurve { id: b, .. }] =
                 self.session.selection.as_slice()
                 && a != b
             {
@@ -1225,7 +1264,7 @@ impl SolveApp {
                     .selection
                     .iter()
                     .filter_map(|s| match s {
-                        solidcraft_engine::Sel::SketchCurve { id } | solidcraft_engine::Sel::SketchPoint { id } => Some(id.clone()),
+                        solidcraft_engine::Sel::SketchCurve { id, .. } | solidcraft_engine::Sel::SketchPoint { id } => Some(id.clone()),
                         _ => None,
                     })
                     .take(2)
@@ -1399,7 +1438,7 @@ impl SolveApp {
     }
 
     pub fn set_status(&mut self, s: impl Into<String>, error: bool) {
-        let (text, at) = (s.into(), now_ms());
+        let (text, at) = (i18n::tr_diagnostic(&s.into()), now_ms());
         self.messages.push(&text, error, at);
         self.status = Some((text, at, error));
         self.status_undo = false;
@@ -1421,10 +1460,9 @@ impl SolveApp {
         file_load::begin(self, path, true);
     }
 
-    /// Insert a STEP file's bodies (an Import base feature) or a mesh file's meshes into the
-    /// current design.
+    /// Insert CAD bodies, meshes or sketch drawing geometry into the current design.
     pub fn insert_path(&mut self, path: &str) {
-        let cmd = if solidcraft_engine::io::is_mesh_path(path) { "file.insert_mesh" } else { "file.insert_step" };
+        let cmd = file_load::insert_command(path);
         let before: Vec<String> = self.session.world_state().bodies.iter().map(|b| b.name.clone()).collect();
         if let Ok(r) = self.run(cmd, json!({ "path": path })) {
             self.fit_view();
@@ -1435,10 +1473,11 @@ impl SolveApp {
         }
     }
 
-    /// A dropped file: a STEP or mesh file (3MF, STL, OBJ, glTF) joins a design that has features, anything else
-    /// opens.
+    /// A dropped CAD, mesh or drawing file joins a design that has features; otherwise it opens.
     pub fn drop_path(&mut self, path: &str) {
-        let import = solidcraft_engine::io::is_step_path(path) || solidcraft_engine::io::is_mesh_path(path);
+        let import = solidcraft_engine::io::is_step_path(path)
+            || solidcraft_engine::io::is_mesh_path(path)
+            || solidcraft_engine::cmd::drawing_import_command(path).is_some();
         if import && !self.session.doc.features.is_empty() {
             self.insert_path_async(path);
         } else {
@@ -1637,6 +1676,11 @@ impl SolveApp {
         self.cam_anim = None;
     }
 
+    /// Is the 3D view dark? As the window, unless Preferences give the view its own (#4146).
+    pub fn viewport_dark(&self) -> bool {
+        self.preferences.viewport_theme.dark().unwrap_or(self.ui.dark)
+    }
+
     /// Hand the view to an external navigation device without a pending mouse orbit or spin
     /// immediately taking it back on the next frame.
     pub fn begin_external_navigation(&mut self) {
@@ -1671,6 +1715,8 @@ impl SolveApp {
         open_meshing::refresh(self, ctx.input(|i| i.time));
         self.esc_handled = false;
         prefs::apply(self, ctx);
+        // The view's own dark or light only changes tokens, not egui's visuals: no restyle.
+        theme::set_viewport_dark(self.preferences.viewport_theme.dark());
         if !self.styled || theme::is_dark() != self.ui.dark || theme::vision() != self.preferences.color_vision {
             theme::set_dark(self.ui.dark);
             theme::set_vision(self.preferences.color_vision);
