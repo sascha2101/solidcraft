@@ -660,6 +660,9 @@ preference_settings! {
     timeline_under_browser: bool = false, PAGE_INTERFACE;
     /// Fold the shared-column history to its header.
     timeline_collapsed: bool = false, PAGE_INTERFACE;
+    /// The browser's share of the column's height when History sits under it, which the user
+    /// drags at the seam between the two cards (#7371).
+    browser_share: f32 = DEFAULT_BROWSER_SHARE, PAGE_INTERFACE;
     /// Whether the browser beside the vertical history is collapsed to its rail.
     timeline_left_browser_collapsed: bool = false, PAGE_INTERFACE;
     /// Whether the History at the left lists a sketch under the feature built from it.
@@ -676,9 +679,6 @@ preference_settings! {
     render_inspector_width: f32 = 305.0;
     render_browser_side: String = "left".into();
     render_browser_width: f32 = 266.0;
-    /// The browser's share of the column's height when History sits under it, which the user
-    /// drags at the seam between the two cards (#7371).
-    browser_share: f32 = DEFAULT_BROWSER_SHARE, PAGE_INTERFACE;
     /// Draw the parts browser on a translucent card over the 3D view instead of a column of its
     /// own, so the workspace keeps the whole window width.
     browser_float: bool = false, PAGE_INTERFACE;
