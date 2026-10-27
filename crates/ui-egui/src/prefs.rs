@@ -445,6 +445,10 @@ impl SpaceMouseDriver {
 /// itself clamps what the user drags to its own range.
 pub const DEFAULT_BROWSER_WIDTH: f32 = 250.0;
 
+/// The browser's first share of the column it shares with History under it (#7371): the equal
+/// split; the column clamps what the user drags so both cards keep their header and two rows.
+pub const DEFAULT_BROWSER_SHARE: f32 = 0.5;
+
 // The stored fields, their defaults, page resets and simple form controls share this table.
 // Omitted pages keep fields such as grid_follows_view and added agents when restoring defaults.
 // Accepted control-channel ranges may differ from slider ranges (look_at_speed).
@@ -672,6 +676,9 @@ preference_settings! {
     render_inspector_width: f32 = 305.0;
     render_browser_side: String = "left".into();
     render_browser_width: f32 = 266.0;
+    /// The browser's share of the column's height when History sits under it, which the user
+    /// drags at the seam between the two cards (#7371).
+    browser_share: f32 = DEFAULT_BROWSER_SHARE, PAGE_INTERFACE;
     /// Draw the parts browser on a translucent card over the 3D view instead of a column of its
     /// own, so the workspace keeps the whole window width.
     browser_float: bool = false, PAGE_INTERFACE;
