@@ -250,27 +250,6 @@ fn sketch_menu_hides_and_moves_to_another_plane() {
 }
 
 #[test]
-fn sketch_entities_offer_the_constraints_that_fit() {
-    let mut app = sample_app();
-    app.run("sketch.create", json!({"plane": "XY"})).unwrap();
-    app.run("sketch.line", json!({"points": [[0, 0], [10, 1]]})).unwrap();
-    app.run("sketch.line", json!({"points": [[0, 5], [10, 7]]})).unwrap();
-    let ids: Vec<String> = {
-        let st = app.session.model.state();
-        let ss = st.sketch(app.session.active_sketch.unwrap()).unwrap();
-        ss.sketch.curves.iter().map(|c| c.id.clone()).collect()
-    };
-    app.run("select.set", json!({"items": ids.iter().map(|i| json!({"type": "sketch_curve", "id": i})).collect::<Vec<_>>()})).unwrap();
-    let items = context_menu::items(&app, &Target::Viewport);
-    let par = find(&items, "Parallel");
-    assert!(find(&items, "Finish Sketch").enabled);
-    context_menu::run_item(&mut app, &par, pos2(0.0, 0.0));
-    let st = app.session.model.state();
-    let ss = st.sketch(app.session.active_sketch.unwrap()).unwrap();
-    assert!(ss.sketch.constraints.iter().any(|c| format!("{:?}", c.kind).contains("Parallel")), "{:?}", ss.sketch.constraints);
-}
-
-#[test]
 fn a_selected_arc_offers_an_arc_length_dimension() {
     // #6039: the arc length dimension existed as a command, but nothing in the UI led to it.
     let mut app = sample_app();
@@ -298,6 +277,27 @@ fn a_selected_arc_offers_an_arc_length_dimension() {
     // A quarter of a circle of radius 10.
     assert!(len.is_some_and(|l| (l - 5.0 * std::f64::consts::PI).abs() < 1e-5), "{:?}", ss.sketch.constraints);
     assert!(ss.report.ok());
+}
+
+#[test]
+fn sketch_entities_offer_the_constraints_that_fit() {
+    let mut app = sample_app();
+    app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+    app.run("sketch.line", json!({"points": [[0, 0], [10, 1]]})).unwrap();
+    app.run("sketch.line", json!({"points": [[0, 5], [10, 7]]})).unwrap();
+    let ids: Vec<String> = {
+        let st = app.session.model.state();
+        let ss = st.sketch(app.session.active_sketch.unwrap()).unwrap();
+        ss.sketch.curves.iter().map(|c| c.id.clone()).collect()
+    };
+    app.run("select.set", json!({"items": ids.iter().map(|i| json!({"type": "sketch_curve", "id": i})).collect::<Vec<_>>()})).unwrap();
+    let items = context_menu::items(&app, &Target::Viewport);
+    let par = find(&items, "Parallel");
+    assert!(find(&items, "Finish Sketch").enabled);
+    context_menu::run_item(&mut app, &par, pos2(0.0, 0.0));
+    let st = app.session.model.state();
+    let ss = st.sketch(app.session.active_sketch.unwrap()).unwrap();
+    assert!(ss.sketch.constraints.iter().any(|c| format!("{:?}", c.kind).contains("Parallel")), "{:?}", ss.sketch.constraints);
 }
 
 #[test]
