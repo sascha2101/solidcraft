@@ -24,9 +24,9 @@ const MAX_BAD_LINES: usize = 8;
 const EVENT_GAP: Duration = Duration::from_millis(100);
 
 static OPEN: AtomicUsize = AtomicUsize::new(0);
-/// The token files this launch wrote (its control port, the agent chat's endpoint), removed
-/// when the app ends.
-static TOKEN_FILES: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// The token files this launch wrote (its control port, the agent chat's endpoint) and the
+/// token in each, removed when the app ends unless another launch has written the file since.
+static TOKEN_FILES: std::sync::Mutex<Vec<(std::path::PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
 
 /// A new random token: 32 bytes from the operating system, as hex.
 fn new_token() -> Option<String> {
@@ -35,20 +35,21 @@ fn new_token() -> Option<String> {
     Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Remove this launch's token file (at exit).
+/// Remove this launch's token files and discovery file (at exit), leaving any that another
+/// launch has written since (#8794).
 pub fn remove_token_file() {
     if let Ok(files) = TOKEN_FILES.lock() {
-        for p in files.iter() {
-            control_auth::remove_token_file(p);
+        for (path, token) in files.iter() {
+            control_auth::remove_token_file(path, token);
         }
     }
-    if let Some(port) = APP_PORT.lock().ok().and_then(|p| *p) {
-        control_auth::remove_current_port(port);
+    if let Some((port, token)) = APP_PORT.lock().ok().and_then(|p| p.clone()) {
+        control_auth::remove_current_port(port, &token);
     }
 }
 
-/// The port the app's own channel listens on, for removing the discovery file at exit.
-static APP_PORT: std::sync::Mutex<Option<u16>> = std::sync::Mutex::new(None);
+/// The port the app's own channel listens on and its token, for removing the discovery file at exit.
+static APP_PORT: std::sync::Mutex<Option<(u16, String)>> = std::sync::Mutex::new(None);
 
 pub fn start(listen_on: control_auth::Listen, ctx: egui::Context) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
@@ -61,7 +62,7 @@ pub fn start(listen_on: control_auth::Listen, ctx: egui::Context) -> Receiver<Co
             };
             match listener {
                 Ok(l) => {
-                    if let Some(port) = listen_on_listener(l, token, tx, ctx, false) {
+                    if let Some(port) = listen_on_listener(l, token.clone(), tx, ctx, false) {
                         if matches!(listen_on, control_auth::Listen::Default) {
                             eprintln!("solidcraft: control channel on the default port 127.0.0.1:{port} (Preferences > Assistant turns it off)");
                         }
@@ -69,7 +70,7 @@ pub fn start(listen_on: control_auth::Listen, ctx: egui::Context) -> Receiver<Co
                         match control_auth::write_current_port(port) {
                             Ok(_) => {
                                 if let Ok(mut p) = APP_PORT.lock() {
-                                    *p = Some(port);
+                                    *p = Some((port, token));
                                 }
                             }
                             Err(e) => eprintln!("solidcraft: could not write the control discovery file ({e})"),
@@ -112,7 +113,7 @@ fn listen_on_listener(listener: TcpListener, token: String, tx: Sender<ControlRe
             Ok(()) => {
                 eprintln!("solidcraft: control server listening on 127.0.0.1:{port} (token in {})", path.display());
                 if let Ok(mut files) = TOKEN_FILES.lock() {
-                    files.push(path);
+                    files.push((path, token.clone()));
                 }
             }
             Err(e) => eprintln!(
@@ -417,7 +418,6 @@ impl Lines {
 struct Subscription {
     lines: Arc<Lines>,
     stop: Arc<AtomicBool>,
-    _counted: Subscriber,
 }
 
 impl Subscription {
@@ -435,10 +435,13 @@ impl Subscription {
         let stop = Arc::new(AtomicBool::new(false));
         let first = lines.turn.lock().unwrap_or_else(PoisonError::into_inner);
         let (l, s) = (lines.clone(), stop.clone());
-        std::thread::Builder::new().stack_size(64 * 1024).spawn(move || send_events(design, &l, &s, seen)).ok()?;
+        // The connection's seat on the watch rides the events thread: it leaves when the thread
+        // does, so the next failed write to a closed client retires it even while the connection's
+        // own thread is slow to see the end of the stream (#7226).
+        std::thread::Builder::new().stack_size(64 * 1024).spawn(move || send_events(design, &l, &s, seen, counted)).ok()?;
         let sent = send(&mut &lines.socket, reply);
         drop(first);
-        Some((Subscription { lines, stop, _counted: counted }, sent))
+        Some((Subscription { lines, stop }, sent))
     }
 }
 
@@ -458,8 +461,10 @@ impl Drop for Subscription {
 }
 
 /// The `design.changed` lines of a subscribed connection, each time the design differs from the
-/// last one it was told of (`seen`), until `stop`.
-fn send_events(design: &DesignWatch, lines: &Lines, stop: &AtomicBool, mut seen: (String, u64)) {
+/// last one it was told of (`seen`), until `stop`. Owns the connection's seat on the watch
+/// (`counted`), so the seat leaves exactly when this thread does: on `stop`, or on the first
+/// write a closed client refuses (#7226).
+fn send_events(design: &DesignWatch, lines: &Lines, stop: &AtomicBool, mut seen: (String, u64), _counted: Subscriber) {
     while !stop.load(Ordering::Relaxed) {
         let Some(now) = design.wait(&seen, stop, Duration::from_secs(1)).filter(|now| *now != seen) else { continue };
         if lines.send(&json!({"event": "design.changed", "params": {"document_id": now.0, "revision": now.1}})).is_err() {
@@ -866,11 +871,17 @@ mod tests {
         assert_eq!(next(&mut lines), json!({"id": 3, "ok": true, "result": "ui.view"}));
         writeln!(quiet_out, "{}", json!({"id": 2, "method": "ui.view"})).unwrap();
         assert_eq!(next(&mut quiet), json!({"id": 2, "ok": true, "result": "ui.view"}), "no events without subscribing");
-        // Closed, it is no longer counted.
+        // Closed, it is no longer counted. Each publish asks the events thread for one more line,
+        // and its write to the closed connection is what retires the seat; that keeps the wait off
+        // the connection's own thread, which anything else this process is doing may hold up past
+        // the deadline (#7226).
         drop((out, lines));
+        let mut revision = 11;
         let deadline = Instant::now() + Duration::from_secs(10);
         while WATCH.subscribed() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+            WATCH.publish("d-1", revision);
+            revision += 1;
+            std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!WATCH.subscribed());
     }

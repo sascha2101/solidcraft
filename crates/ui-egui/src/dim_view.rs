@@ -20,7 +20,9 @@ use egui::{FontId, Pos2, Rect, Shape, Stroke, vec2};
 use serde_json::json;
 use solidcraft_engine::Sel;
 use solidcraft_engine::geom::Vec2;
-use solidcraft_engine::sketch::{ConstraintKind, DimFrame, chain_centres, default_text, dim_frame, dim_layout_reaching, dim_reach};
+use solidcraft_engine::sketch::{
+    ConstraintKind, DimFrame, chain_centres, default_text, default_text_offset, dim_frame, dim_layout_reaching, dim_reach,
+};
 
 use crate::SolveApp;
 use crate::theme::Tokens;
@@ -102,7 +104,7 @@ impl DimensionDraft {
     }
     fn params(&self, expr: &str) -> serde_json::Value {
         // The first dimension of a sketch scales it rather than distorting it (#1365).
-        let mut params = json!({"entities": self.entities, "value": expr, "scale_sketch": true});
+        let mut params = json!({"entities": entities_value(&self.entities), "value": expr, "scale_sketch": true});
         if let Some(at) = self.at {
             params["text_at"] = json!([at.x, at.y]);
         }
@@ -147,8 +149,8 @@ pub fn begin_dimension(app: &mut SolveApp, entities: Vec<String>, at: Vec2) -> R
     let (param, expr, draft) = dimension_draft(app, entities, Some(at))?;
     if draft.driven {
         PLACEMENT.with(|preview| *preview.borrow_mut() = None);
-        app.run("sketch.dimension", json!({"entities": draft.entities, "text_at": [at.x, at.y], "driven": true}))?;
-        app.set_status("The sketch already determines that dimension, so it was added as a driven (reference) dimension", false);
+        app.run("sketch.dimension", json!({"entities": entities_value(&draft.entities), "text_at": [at.x, at.y], "driven": true}))?;
+        app.set_status(crate::i18n::tr("sketch.dimension_added_driven"), false);
         return Ok(());
     }
     EDIT.with(|edit| {
@@ -200,8 +202,8 @@ pub fn pin(app: &SolveApp, at: Vec2) {
 }
 
 /// Move a draft's text to `at`. Where the text goes can change what the dimension measures
-/// (two points or a slanted line: across from them the distance between them, above or below
-/// the horizontal one, beside them the vertical one), so a value nothing was typed into yet
+/// (two points or a slanted line: inside the box they span the distance between them, above or
+/// below it the horizontal one, beside it the vertical one), so a value nothing was typed into yet
 /// becomes what the new dimension measures; carrying the old one over would preview, and on
 /// Enter apply, the aligned length as a horizontal or vertical span, moving the picked points.
 fn move_text(app: &SolveApp, e: &mut Edit, at: Vec2) {
@@ -235,6 +237,18 @@ fn reevaluate(app: &SolveApp, draft: &mut DimensionDraft, expr: &str) {
     }
 }
 
+/// The entities a dimension measures, as the command takes them: a sketch entity by its id, a
+/// model edge or vertex by its reference (#7912), read back from the pick's text as the
+/// constraint tools do (#6348).
+fn entities_value(entities: &[String]) -> serde_json::Value {
+    serde_json::Value::Array(
+        entities
+            .iter()
+            .map(|entity| serde_json::from_str(entity).ok().filter(serde_json::Value::is_object).unwrap_or_else(|| json!(entity)))
+            .collect(),
+    )
+}
+
 fn dimension_draft(app: &SolveApp, entities: Vec<String>, at: Option<Vec2>) -> Result<(String, String, DimensionDraft), String> {
     let sketch = app.session.active_sketch.ok_or("Edit a sketch to add a dimension")?;
     if entities.is_empty() || entities.len() > 2 || at.is_some_and(|at| !at.x.is_finite() || !at.y.is_finite()) {
@@ -249,7 +263,7 @@ fn dimension_draft(app: &SolveApp, entities: Vec<String>, at: Option<Vec2>) -> R
 /// has no parameter), the parameter's expression, and the scratch session it was added in.
 fn draft_of(app: &SolveApp, sketch: u64, entities: &[String], at: Option<Vec2>, driven: bool) -> Result<(String, String, DimensionDraft), String> {
     let mut scratch = app.session.scratch();
-    let mut params = json!({"entities": entities, "driven": driven});
+    let mut params = json!({"entities": entities_value(entities), "driven": driven});
     if let Some(at) = at {
         params["text_at"] = json!([at.x, at.y]);
     }
@@ -627,6 +641,9 @@ pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &P
         let ours = |c: &&solidcraft_engine::sketch::Constraint| c.param.as_deref() == Some(param.as_str()) || (c.driven && c.id == *param);
         constraints.extend(source.sketch.constraints.iter().filter(ours).map(|c| (source, c, true)));
     }
+    // Text boxes already drawn this frame, in draw order: a later dimension that would land
+    // on one of them steps clear of it (#44).
+    let mut placed: Vec<Rect> = Vec::new();
     for (source, c, is_draft) in constraints {
         if ss.sketch.view.hide_dimensions && !is_draft {
             continue;
@@ -651,7 +668,7 @@ pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &P
         let expr = c.param.as_ref().and_then(|p| display_doc.param(p)).map(|p| p.expr.as_str());
         let failing = source.report.failing.contains(&c.id);
         let col = if failing {
-            tk.error
+            crate::viewport::Conflict::glyph_colour(app, &tk)
         } else if is_sel(&c.id) || hover.as_deref() == Some(c.id.as_str()) {
             tk.accent
         } else if c.driven {
@@ -665,7 +682,25 @@ pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &P
         let half = Vec2::new(f64::from(size.x) * 0.5 * px, f64::from(size.y) * 0.5 * px);
         // Unplaced linear dimensions sit outside the shape they measure.
         let away = first_point(sk, &c.kind).and_then(|p| centres.get(p).copied()).unwrap_or(anchor);
-        let lay = dim_layout_reaching(&frame, c.text.or_else(|| default_text(&frame, away, px)), px, half, dim_reach(sk, &c.kind));
+        let reach = dim_reach(sk, &c.kind);
+        let mut text = c.text.or_else(|| default_text(&frame, away, px));
+        let mut lay = dim_layout_reaching(&frame, text, px, half, reach);
+        // #44: a text that would land on an already-drawn dimension's text steps to the next
+        // row — across the dimension line for a linear one, out from the centre for the rest —
+        // so stacked dimensions read as rows instead of one overwriting the next.
+        for _ in 0..6 {
+            let Some(t) = to(lay.text) else { break };
+            if !placed.iter().any(|q| q.expand(-0.5).intersects(Rect::from_center_size(t, size).expand(-0.5))) {
+                break;
+            }
+            let row = (f64::from(size.y) + 2.0) * px;
+            let base = text.unwrap_or_else(|| default_text_offset(&frame, px));
+            text = Some(match frame {
+                DimFrame::Linear { .. } => base + Vec2::new(0.0, row * if base.y < 0.0 { -1.0 } else { 1.0 }),
+                _ => base + base.normalized().unwrap_or(Vec2::X) * row,
+            });
+            lay = dim_layout_reaching(&frame, text, px, half, reach);
+        }
         let stroke = Stroke::new(1.0, col);
         let mut segs = Vec::new();
         for line in &lay.lines {
@@ -682,6 +717,7 @@ pub fn show(app: &mut SolveApp, ui: &egui::Ui, painter: &egui::Painter, proj: &P
         }
         let Some(tc) = to(lay.text) else { continue };
         let r = Rect::from_center_size(tc, size);
+        placed.push(r);
         painter.rect_filled(r, tk.radius_sm / 2, tk.viewport_top.gamma_multiply(0.85));
         painter.galley(r.min + vec2(3.0, 1.0), galley, col);
         if matches!(frame, DimFrame::ArcLength { .. }) {
@@ -851,7 +887,8 @@ fn edit_box(app: &mut SolveApp, ctx: &egui::Context) {
         anchor.x = anchor.x.clamp(rect.left(), (rect.right() - popup_width - 6.0).max(rect.left()));
         anchor.y = anchor.y.clamp(rect.top(), (rect.bottom() - 80.0).max(rect.top()));
     }
-    Container::new(ctx, Surface::Canvas).area(egui::Id::new("sc_dim_edit_area")).fixed_pos(anchor).order(egui::Order::Foreground).show(ctx, |ui| {
+    // Background: under Preferences and Report a bug (#9016), like canvas value boxes.
+    Container::new(ctx, Surface::Canvas).area(egui::Id::new("sc_dim_edit_area")).fixed_pos(anchor).order(egui::Order::Background).show(ctx, |ui| {
         Container::popup_frame(ui.style()).fill(Tokens::get().dialog_body).inner_margin(Tokens::get().space_4).show(ui, |ui| {
             crate::ui_kit::scope(ui, |ui| {
                 ui.set_max_width(popup_width);
@@ -927,10 +964,15 @@ fn edit_box(app: &mut SolveApp, ctx: &egui::Context) {
                 }
                 Ok(reply) => {
                     clear_picks(app);
-                    match reply.get("defined").and_then(serde_json::Value::as_str) {
-                        Some(name) => app.set_status(format!("Dimension applied; parameter `{name}` defined"), false),
-                        None => app.set_status("Dimension applied", false),
-                    }
+                    // A new dimension defines its parameter; an edited one renames its own (#4071).
+                    // The sentence comes from the catalog, so it reads in the interface language (#8863).
+                    let named = reply.get("renamed").and_then(|r| r.get("to")).and_then(serde_json::Value::as_str);
+                    let status = match (reply.get("defined").and_then(serde_json::Value::as_str), named) {
+                        (Some(name), _) => crate::i18n::format("sketch.dimension_applied_defined", &[("name", name)]),
+                        (None, Some(name)) => crate::i18n::format("sketch.dimension_applied_renamed", &[("name", name)]),
+                        (None, None) => crate::i18n::tr("sketch.dimension_applied").to_string(),
+                    };
+                    app.set_status(status, false);
                 }
             }
         }
@@ -997,6 +1039,53 @@ mod tests {
         for t in ["", "10 + ", "2 * (", "Width - ", "width", "d1", "10 mm + d2", "(10)", "mm", "-"] {
             assert!(!is_plain_value(t), "{t:?}");
         }
+    }
+
+    /// A sketch's dimensions draw their lines and arrows in the theme's dimension colours,
+    /// driving and driven, never in the colour of the curves they measure (#7861).
+    #[test]
+    fn dimensions_are_drawn_in_the_dimension_colours() {
+        fn strokes(s: &Shape, out: &mut std::collections::BTreeSet<[u8; 4]>) {
+            match s {
+                Shape::LineSegment { stroke, .. } => {
+                    out.insert(stroke.color.to_array());
+                }
+                Shape::Path(p) => {
+                    if let egui::epaint::ColorMode::Solid(c) = p.stroke.color {
+                        out.insert(c.to_array());
+                    }
+                }
+                Shape::Vec(v) => v.iter().for_each(|s| strokes(s, out)),
+                _ => {}
+            }
+        }
+        cancel();
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        let mut line = |y: f64| {
+            h.app.run("sketch.line", json!({"points":[[0,y],[30,y]],"connect":false,"infer":false})).unwrap()["curves"][0]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let (driving, driven) = (line(0.0), line(20.0));
+        h.app.run("sketch.dimension", json!({"entities":[driving],"value":30})).unwrap();
+        h.app.run("sketch.dimension", json!({"entities":[driven],"driven":true})).unwrap();
+        h.app.session.selection.clear();
+        h.call("ui.view", json!({"view":"top"}));
+        h.settle();
+        h.frames(2);
+        assert_eq!(drawn().len(), 2, "both dimensions are drawn");
+        let tk = Tokens::get();
+        let mut seen = std::collections::BTreeSet::new();
+        h.shapes.iter().for_each(|s| strokes(&s.shape, &mut seen));
+        for (name, c) in [("dimension", tk.dimension), ("dimension_driven", tk.dimension_driven)] {
+            assert!(seen.contains(&c.to_array()), "no line drawn in {name} {c:?}: {seen:?}");
+            assert_ne!(c, tk.sketch, "{name}");
+            assert_ne!(c, tk.sketch_fixed, "{name}");
+        }
+        cancel();
     }
 
     /// Typing `rad` into a new dimension's value lists `radius` although `rad` is itself the
@@ -1190,6 +1279,60 @@ mod tests {
         assert_eq!(h.app.session.doc.to_json(), baseline);
         assert_eq!(h.app.session.undo.len(), undo);
         cancel();
+    }
+
+    /// Two dimensions whose texts were placed on the same spot: the later one steps to the
+    /// next row instead of sitting on the first (#44).
+    #[test]
+    fn dimension_texts_placed_on_each_other_step_clear() {
+        cancel();
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.app.run("sketch.line", json!({"points":[[0,10],[20,10]],"infer":false})).unwrap();
+        h.app.run("sketch.line", json!({"points":[[0,0],[20,0]],"infer":false})).unwrap();
+        // Both texts are placed at the same sketch point: unnudged, they would coincide.
+        h.app.run("sketch.dimension", json!({"entities":["l1"],"text_at":[10,20]})).unwrap();
+        h.app.run("sketch.dimension", json!({"entities":["l2"],"text_at":[10,20]})).unwrap();
+        h.call("ui.view", json!({"view":"top"}));
+        h.app.cam.distance = 90.;
+        h.app.cam.target = solidcraft_engine::geom::Vec3::new(10., 10., 0.);
+        h.settle();
+        let rects = crate::dim_view::text_rects();
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        let want = h.at(&json!({"world":[10., 20., 0.]})).unwrap();
+        let first = rects[0].1.center();
+        assert!((first.x as f64 - want[0]).abs() < 1.5 && (first.y as f64 - want[1]).abs() < 1.5, "the first text stays where it was clicked");
+        assert!(!rects[0].1.expand(-0.5).intersects(rects[1].1.expand(-0.5)), "the second text stepped clear: {:?} {:?}", rects[0].1, rects[1].1);
+    }
+
+    /// Editing a dimension's value moves the geometry it measures; its placed text keeps its
+    /// offset from that geometry rather than jumping to the default place (#44).
+    #[test]
+    fn a_dimension_text_keeps_its_offset_from_the_geometry_when_edited() {
+        cancel();
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.app.run("sketch.line", json!({"points":[[0,10],[20,10]],"infer":false})).unwrap();
+        let param = h.app.run("sketch.dimension", json!({"entities":["l1"],"text_at":[10,25]})).unwrap()["param"].as_str().unwrap().to_string();
+        h.call("ui.view", json!({"view":"top"}));
+        h.app.cam.distance = 120.;
+        h.app.cam.target = solidcraft_engine::geom::Vec3::new(10., 12., 0.);
+        h.settle();
+        h.app.run("parameters.change", json!({"name":param,"expression":"30"})).unwrap();
+        h.settle();
+        let state = h.app.session.world_state();
+        let solved = state.sketch(h.app.session.active_sketch.unwrap()).unwrap();
+        let c = solved.sketch.constraints.iter().find(|c| c.param.as_deref() == Some(param.as_str())).unwrap();
+        // The placed offset (15 above the measured line) is kept with the dimension.
+        assert_eq!(c.text, Some(Vec2::new(0.0, 15.0)), "{c:?}");
+        // And the text draws at that offset from the edited geometry, not at the default place.
+        let DimFrame::Linear { p0, p1, dir } = dim_frame(&solved.sketch, &c.kind).unwrap() else { panic!("a length dimension is linear") };
+        let t = c.text.unwrap();
+        let want = h
+            .at(&json!({"world":[(p0 + p1).x * 0.5 + dir.x * t.x + dir.perp().x * t.y, (p0 + p1).y * 0.5 + dir.y * t.y + dir.perp().y * t.y, 0.]}))
+            .unwrap();
+        let shown = crate::dim_view::text_at(&param).unwrap();
+        assert!((shown.x as f64 - want[0]).abs() < 1.5 && (shown.y as f64 - want[1]).abs() < 1.5, "the text stayed put relative to the geometry");
     }
 
     #[test]

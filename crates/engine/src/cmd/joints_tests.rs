@@ -192,6 +192,9 @@ fn rigid_cycles_solve_and_conflicts_report() {
     let c = r["conflicts"].as_array().cloned().unwrap_or_default();
     assert_eq!(c.len(), 1, "{r}");
     assert!(c[0]["why"].as_str().unwrap_or("").contains("off by"), "{r}");
+    // A rigid joint has nothing to drive: the refusal names the types that move (#6981).
+    let e = s.execute("joint.drive", &json!({"joint": "Wrong", "value": 1})).map(|_| ()).unwrap_err().to_string();
+    assert!(e.contains("does not move") && e.contains("joint.edit") && e.contains("revolute") && e.contains("cylindrical"), "{e}");
     // Suppressing it clears the conflict.
     let r = run(&mut s, "joint.edit", json!({"joint": "Wrong", "suppressed": true}));
     assert_eq!(r["conflicts"].as_array().map(Vec::len), Some(0));
@@ -299,6 +302,38 @@ fn faces_mate_by_default() {
     assert!(near(place(&s, "B", Vec3::new(25.0, 5.0, 10.0)), Vec3::new(5.0, 5.0, 20.0)), "{:?}", place(&s, "B", Vec3::new(25.0, 5.0, 10.0)));
     run(&mut s, "joint.edit", json!({"joint": "Stack", "flip": true}));
     assert!(near(place(&s, "B", Vec3::new(25.0, 5.0, 10.0)), Vec3::new(5.0, 5.0, 0.0)), "{:?}", place(&s, "B", Vec3::new(25.0, 5.0, 10.0)));
+}
+
+/// A move of a jointed part that the joint takes back: the model is evaluated for the
+/// placements the solve leaves, so a mirror of the part's body, made from the root, is where a
+/// fresh evaluation of the design puts it. The model was the one evaluated for the move before
+/// the solve took it back, and its mirror didn't match the part.
+#[test]
+fn a_feature_reading_a_jointed_parts_placement_follows_the_solve() {
+    let mut s = Session::default();
+    for (cmd, p) in [
+        ("component.create", json!({"grounded": true, "name": "Base"})),
+        ("solid.box", json!({"corner": [-11, -25, 0], "height": 9, "length": 11, "width": 14})),
+        ("component.create", json!({"grounded": false, "name": "Slide"})),
+        ("solid.cylinder", json!({"base": [-2, -10, 7], "height": 7, "radius": 2})),
+        ("component.activate", json!({"component": "root"})),
+        ("joint.as_built", json!({"a": "Base:1", "b": "Slide:1", "name": "Rail", "type": "slider"})),
+        ("solid.mirror", json!({"bodies": ["Body2"], "plane": "XY"})),
+        ("occurrence.move", json!({"occurrence": "Slide:1", "translate": [-10, -18, 2]})),
+    ] {
+        s.execute(cmd, &p).unwrap_or_else(|e| panic!("{cmd}: {e}"));
+    }
+    let boxes = |st: &solidcraft_doc::ModelState| {
+        st.bodies
+            .iter()
+            .map(|b| (b.name.clone(), b.body.outline_bounds()))
+            .map(|(n, bb)| format!("{n} {:.6?} {:.6?}", bb.min, bb.max))
+            .collect::<Vec<_>>()
+    };
+    let mut fresh = solidcraft_doc::Model::new();
+    fresh.no_cache = true;
+    fresh.evaluate(&s.doc);
+    assert_eq!(boxes(&s.model.state()), boxes(&fresh.state()));
 }
 
 /// #1239: two parts as bodies of one component (a multi-body STEP import). The refusal names the
@@ -2172,4 +2207,35 @@ fn a_parameter_change_solves_the_joints_once() {
     run(&mut s, "occurrence.move", json!({"occurrence": bracket, "translate": [5, 0, 0], "capture": true}));
     assert!(super::solve_counts::take().0 > 0);
     assert!(near(place(&s, "Bracket", Vec3::new(110.0, 210.0, 0.0)), Vec3::new(180.0, 50.0, 1.0)));
+}
+
+#[test]
+fn driving_one_cylindrical_coordinate_preserves_the_other_expression_and_reports_continuous() {
+    let mut s = Session::default();
+    run(&mut s, "component.create", json!({"name":"Part","grounded":false}));
+    run(&mut s, "solid.box", json!({"length":10,"width":10,"height":10}));
+    run(&mut s, "component.activate", json!({"component":"root"}));
+    run(&mut s, "parameters.add", json!({"name":"turn","expression":"30 deg"}));
+    let joint = run(
+        &mut s,
+        "joint.create",
+        json!({"type":"cylindrical","a":{"occurrence":0,"point":[0,0,0]},"b":{"occurrence":"Part","point":[0,0,0]},"flip":true,"values":["turn",0]}),
+    )["joint"]
+        .as_u64()
+        .unwrap();
+    let before = s.doc.assembly.joints.iter().find(|j| j.id == joint).unwrap().exprs.value(0).map(str::to_string);
+    assert!(before.is_some());
+    let reply = run(&mut s, "joint.drive", json!({"joint":joint,"index":1,"value":12,"continuous":true,"quiet":true}));
+    assert_eq!(reply["continuous"], true);
+    let j = s.doc.assembly.joints.iter().find(|j| j.id == joint).unwrap();
+    assert_eq!(j.exprs.value(0).map(str::to_string), before);
+    assert!((j.values[0].to_degrees() - 30.).abs() < 1e-7);
+    assert!((j.values[1] - 12.).abs() < 1e-7);
+    run(&mut s, "parameters.change", json!({"name":"turn","expression":"40 deg"}));
+    let j = s.doc.assembly.joints.iter().find(|j| j.id == joint).unwrap();
+    assert!((j.values[0].to_degrees() - 40.).abs() < 1e-7, "the preserved expression still drives the angle");
+    assert!((j.values[1] - 12.).abs() < 1e-7);
+    for bad in [json!(-1), json!(2), json!(1000000), json!("0")] {
+        assert!(s.execute("joint.drive", &json!({"joint":joint,"index":bad,"value":0})).is_err());
+    }
 }
