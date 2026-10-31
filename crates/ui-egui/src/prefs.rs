@@ -254,10 +254,15 @@ impl Prefs {
         self.nav != TOUCHPAD_NAV && self.trackpad_pan
     }
 
-    /// The 3D view's own background, top and bottom: `viewport_background` alone gives one colour
-    /// (#7688), with `viewport_background_bottom` a gradient (#9230). `None`: the theme's gradient.
-    pub fn viewport_background_colours(&self) -> Option<([u8; 3], [u8; 3])> {
-        self.viewport_background.map(|top| (top, self.viewport_background_bottom.unwrap_or(top)))
+    /// The 3D view's own background: `viewport_background` alone gives one colour (#7688), with
+    /// `viewport_background_bottom` a gradient, and `viewport_background_middle` a colour halfway
+    /// down that gradient (#9230). `None`: the theme's gradient.
+    pub fn viewport_background_colours(&self) -> Option<crate::theme::ViewBackground> {
+        let top = self.viewport_background?;
+        Some(match self.viewport_background_bottom {
+            Some(bottom) => crate::theme::ViewBackground { top, middle: self.viewport_background_middle, bottom },
+            None => crate::theme::ViewBackground::flat(top),
+        })
     }
 }
 
@@ -1073,6 +1078,9 @@ preference_settings! {
     /// gradient of the user's own (#9230). `None` (the default): `viewport_background` alone, one
     /// colour; without `viewport_background` it does nothing.
     viewport_background_bottom: Option<[u8; 3]> = None, PAGE_INTERFACE;
+    /// A colour halfway down the user's gradient (#9230). `None` (the default): straight from top
+    /// to bottom; without `viewport_background_bottom` it does nothing.
+    viewport_background_middle: Option<[u8; 3]> = None, PAGE_INTERFACE;
     /// The application bar's logo in the theme's accent instead of the theme's logo colours.
     logo_accent: bool = false, PAGE_INTERFACE;
     /// Imported theme files (`theme_files`), kept here so they also work in the browser.
@@ -5493,6 +5501,7 @@ mod tests {
             ("viewport_theme", json!("light"), PAGE_INTERFACE),
             ("viewport_background", json!([255, 255, 255]), PAGE_INTERFACE),
             ("viewport_background_bottom", json!([0, 0, 0]), PAGE_INTERFACE),
+            ("viewport_background_middle", json!([0, 0, 0]), PAGE_INTERFACE),
             ("view_confirm_corner", json!(true), PAGE_INTERFACE),
             ("status_bar", json!(true), PAGE_INTERFACE),
             ("browser_eye_left", json!(true), PAGE_INTERFACE),
@@ -5942,7 +5951,7 @@ mod tests {
 
         let mut other = crate::SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
         other.load_prefs(&h.app.prefs());
-        assert_eq!(other.preferences.viewport_background_colours(), Some((top, bottom)));
+        assert_eq!(other.preferences.viewport_background_colours(), Some(crate::theme::ViewBackground { top, middle: None, bottom }));
 
         h.call("ui.prefs", json!({"viewport_background": null}));
         h.frames(2);
@@ -5951,6 +5960,66 @@ mod tests {
 
         for bad in [json!([256, 0, 0]), json!("black"), json!([1, 2])] {
             assert!(h.call("ui.prefs", json!({"viewport_background_bottom": bad}))["error"].is_string(), "{bad}");
+        }
+    }
+
+    /// Background → Gradient → Middle colour (#9230): a third colour of the user's halfway down
+    /// the gradient. The view paints two bands through it, a picture of the view has it, and it is
+    /// saved with the preferences. It belongs to the gradient: with one colour, or without a top
+    /// colour, it does nothing; cleared, the gradient runs straight from top to bottom again.
+    #[test]
+    fn the_3d_view_gradient_takes_a_middle_colour() {
+        use crate::theme::{Tokens, ViewBackground};
+        use egui::Color32;
+        use serde_json::json;
+        use solidcraft_engine::render::Rgb;
+        let mut h = crate::scenario::Harness::new();
+        assert_eq!(h.app.preferences.viewport_background_middle, None);
+        let (top, middle, bottom) = ([250, 200, 120], [90, 160, 60], [20, 40, 90]);
+        let out = h.call("ui.prefs", json!({"viewport_background": top, "viewport_background_middle": middle, "viewport_background_bottom": bottom}));
+        assert!(out["error"].is_null(), "{out}");
+        h.frames(2);
+        let colour = Color32::from_rgb(90, 160, 60);
+        assert_eq!((Tokens::get().viewport_middle, Tokens::view().viewport_middle), (Some(colour), Some(colour)));
+        let scene = crate::control::view_scene(&h.app, solidcraft_engine::view::Guides::default());
+        assert_eq!(scene.background_middle, Some(Rgb(90, 160, 60)), "a picture of the view");
+
+        // The view: two bands, the middle colour across the middle.
+        let ctx = egui::Context::default();
+        let t = Tokens::get();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| crate::gpu::paint_background(ui.painter(), ui.max_rect(), &t));
+        let mesh = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) => Some(mesh.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(mesh.indices.len(), 12, "two bands of two triangles");
+        let (high, low) = mesh.vertices.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v.pos.y), b.max(v.pos.y)));
+        for v in mesh.vertices.iter().filter(|v| v.color == colour) {
+            assert!((v.pos.y - (high + low) / 2.0).abs() < 0.5, "the middle colour sits halfway down: {:?}", v.pos);
+        }
+        assert_eq!(mesh.vertices.iter().filter(|v| v.color == colour).count(), 2);
+
+        let mut other = crate::SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+        other.load_prefs(&h.app.prefs());
+        assert_eq!(other.preferences.viewport_background_colours(), Some(ViewBackground { top, middle: Some(middle), bottom }));
+
+        // One colour: no middle.
+        h.call("ui.prefs", json!({"viewport_background_bottom": null}));
+        h.frames(2);
+        assert_eq!(h.app.preferences.viewport_background_colours(), Some(ViewBackground::flat(top)));
+        assert_eq!(Tokens::get().viewport_middle, None);
+        // The gradient again, the middle cleared: straight from top to bottom.
+        h.call("ui.prefs", json!({"viewport_background_bottom": bottom, "viewport_background_middle": null}));
+        h.frames(2);
+        assert_eq!(Tokens::get().viewport_middle, None);
+        assert_eq!(crate::control::view_scene(&h.app, solidcraft_engine::view::Guides::default()).background_middle, None);
+
+        for bad in [json!([256, 0, 0]), json!("green"), json!([1, 2])] {
+            assert!(h.call("ui.prefs", json!({"viewport_background_middle": bad}))["error"].is_string(), "{bad}");
         }
     }
 

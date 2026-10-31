@@ -47,7 +47,7 @@ pub(super) fn interface(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
                 }
             });
             // The view's background: the theme's gradient, one colour of the user's (#7688), or a
-            // gradient of the user's, top colour then bottom (#9230).
+            // gradient of the user's, top colour then bottom, with an optional colour halfway (#9230).
             let label = app.tr("prefs.viewport_background");
             ui_kit::row(ui, label, |ui| {
                 let labels = [
@@ -66,13 +66,28 @@ pub(super) fn interface(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
                     prefs.viewport_background = (selected > 0).then_some(top);
                     prefs.viewport_background_bottom = (selected == 2).then(|| prefs.viewport_background_bottom.unwrap_or(top));
                 }
-                if let Some(colour) = &mut prefs.viewport_background {
+                if let (Some(colour), None) = (&mut prefs.viewport_background, prefs.viewport_background_bottom) {
                     ui_kit::color_field(ui, colour);
-                    if let Some(bottom) = &mut prefs.viewport_background_bottom {
-                        ui_kit::color_field(ui, bottom);
-                    }
                 }
             });
+            // The gradient's colours on a line of their own, top to bottom: next to the segments
+            // they would not fit.
+            let prefs = &mut app.preferences;
+            if let (Some(top), Some(bottom)) = (&mut prefs.viewport_background, &mut prefs.viewport_background_bottom) {
+                ui_kit::row(ui, "", |ui| {
+                    ui_kit::color_field(ui, top);
+                    // The middle colour starts halfway between the two.
+                    let mut middle = prefs.viewport_background_middle.is_some();
+                    if ui_kit::checkbox(ui, crate::i18n::tr("prefs.viewport_background_middle"), &mut middle).changed() {
+                        let halfway = std::array::from_fn(|k| ((u16::from(top[k]) + u16::from(bottom[k])) / 2) as u8);
+                        prefs.viewport_background_middle = middle.then_some(halfway);
+                    }
+                    if let Some(middle) = &mut prefs.viewport_background_middle {
+                        ui_kit::color_field(ui, middle);
+                    }
+                    ui_kit::color_field(ui, bottom);
+                });
+            }
             // The logo in the theme's own logo colours or in its accent.
             let label = app.tr("prefs.logo");
             ui_kit::row(ui, label, |ui| {
